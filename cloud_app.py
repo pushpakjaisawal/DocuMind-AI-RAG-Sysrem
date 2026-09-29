@@ -1,6 +1,9 @@
 import os
 import base64
 import io
+import sys
+import logging
+import traceback
 import requests
 import chromadb
 import streamlit as st
@@ -8,28 +11,46 @@ import fitz # PyMuPDF
 from groq import Groq
 from dotenv import load_dotenv
 
-# 1. LOAD CONFIGURATION
+# 1. CONFIGURE DEBUG LOGGING
+# This sends logs to the Streamlit Cloud console (visible in "Manage App" -> "Logs")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("DocuMind")
+
+# 2. LOAD CONFIGURATION & VALIDATE SECRETS
 load_dotenv()
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not NVIDIA_API_KEY:
-    st.error("CRITICAL: NVIDIA_API_KEY is missing from Streamlit Secrets!")
+# CRITICAL DEBUG CHECK: Ensure keys are actually loaded from Streamlit Secrets
+missing_keys = []
+if not JINA_API_KEY: missing_keys.append("JINA_API_KEY")
+if not NVIDIA_API_KEY: missing_keys.append("NVIDIA_API_KEY")
+if not GROQ_API_KEY: missing_keys.append("GROQ_API_KEY")
+
+if missing_keys:
+    st.error(f" CRITICAL: Missing API Keys in Streamlit Secrets: {', '.join(missing_keys)}")
+    st.info("Go to 'Manage App' -> 'Settings' -> 'Secrets' and add them in TOML format.")
+    st.stop()
+
+logger.info("✅ All API keys successfully loaded from environment.")
 
 JINA_MODEL = "jina-embeddings-v5-omni-small"
 NVIDIA_VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# 2. PIPELINE CLASSES
+# 3. PIPELINE CLASSES
 class JinaEmbedder:
     def __init__(self):
         self.url = "https://api.jina.ai/v1/embeddings"
         self.headers = {"Authorization": f"Bearer {JINA_API_KEY}", "Content-Type": "application/json"}
 
     def embed_batch(self, texts: list[str], task: str) -> list[list[float]]:
+        logger.info(f"Embedding {len(texts)} texts via Jina (Task: {task})...")
         payload = {"model": JINA_MODEL, "input": [{"text": t} for t in texts], "task": task, "normalized": True}
         resp = requests.post(self.url, headers=self.headers, json=payload, timeout=60)
+        if resp.status_code != 200:
+            logger.error(f"Jina API Error: {resp.status_code} - {resp.text}")
         resp.raise_for_status()
         return [item["embedding"] for item in resp.json()["data"]]
 
@@ -38,7 +59,8 @@ class NvidiaVisionBridge:
         self.url = "https://integrate.api.nvidia.com/v1/chat/completions"
         self.headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"}
 
-    def describe_image(self, img_base64: str) -> str:
+    def describe_image(self, img_base64: str, page_num: int) -> str:
+        logger.info(f"Sending Page {page_num} to NVIDIA Vision API... (Payload size: {len(img_base64)} chars)")
         payload = {
             "model": NVIDIA_VISION_MODEL,
             "messages": [{"role": "user", "content": [
@@ -48,16 +70,23 @@ class NvidiaVisionBridge:
             "temperature": 0.1, "max_tokens": 1500, "stream": False
         }
         response = requests.post(self.url, headers=self.headers, json=payload, timeout=60)
+        
         if response.status_code != 200:
-            raise Exception(f"NVIDIA API Error {response.status_code}: {response.text}")
+            error_msg = f"NVIDIA API Error {response.status_code}: {response.text}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+            
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        extracted_text = response.json()["choices"][0]["message"]["content"]
+        logger.info(f"Page {page_num} extracted successfully. Length: {len(extracted_text)} chars.")
+        return extracted_text
 
 class GroqGenerator:
     def __init__(self):
         self.client = Groq(api_key=GROQ_API_KEY)
 
     def generate(self, query: str, context: str, chat_history: list) -> str:
+        logger.info(f"Generating response via Groq. Context length: {len(context)} chars. History turns: {len(chat_history)}")
         system_prompt = """You are a precision AI analyst analyzing a document. 
         RULES: 1. Answer comprehensively. If the user asks for a list, provide the COMPLETE list. 
         2. Start DIRECTLY with the answer. No pleasantries. 3. Use ONLY the provided context. 
@@ -72,9 +101,10 @@ class GroqGenerator:
         answer = completion.choices[0].message.content
         return answer if answer and answer.strip() else "Data not found in the provided context."
 
-# 3. GLOBAL STATE
+# 4. GLOBAL STATE
 @st.cache_resource
 def init_db():
+    logger.info("Initializing ChromaDB...")
     client = chromadb.PersistentClient(path="./chroma_db_storage")
     return client.get_or_create_collection(name="documind_streamlit_cloud", metadata={"hnsw:space": "cosine"})
 
@@ -83,7 +113,7 @@ embedder = JinaEmbedder()
 vision_bridge = NvidiaVisionBridge()
 generator = GroqGenerator()
 
-# 4. UI & LOGIC
+# 5. UI & LOGIC
 st.set_page_config(page_title="DocuMind AI", page_icon="🧠", layout="wide")
 
 st.markdown("""
@@ -108,7 +138,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🧠 DocuMind AI")
+st.title(" DocuMind AI")
 st.caption("Multimodal Vision-RAG | Precision Document Analysis")
 st.divider()
 
@@ -121,12 +151,20 @@ with st.sidebar:
     else: st.info("ℹ️ No document loaded")
     st.divider()
     
+    # DEBUG EXPANDER (Hidden by default, click to see live logs in UI)
+    with st.expander("️ Debug / System Logs", expanded=False):
+        st.caption("Live backend logs:")
+        # We can't easily stream live logs here, but we can show status
+        st.info(f"DB Collection Size: {collection.count()} documents")
+
     if uploaded_file and uploaded_file.name != st.session_state.active_doc:
         with st.status(f"Analyzing {uploaded_file.name}...", expanded=True) as status:
             try:
+                logger.info(f"Starting ingestion for: {uploaded_file.name}")
                 file_bytes = uploaded_file.read()
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 max_pages = min(len(doc), 20)
+                logger.info(f"PDF loaded. Total pages to process: {max_pages}")
                 
                 valid_texts, valid_ids, valid_metas = [], [], []
                 for i in range(max_pages):
@@ -136,8 +174,10 @@ with st.sidebar:
                     img_bytes = pix.tobytes("jpeg")
                     img_b64 = base64.b64encode(img_bytes).decode('utf-8').replace('\n', '')
                     
-                    text_desc = vision_bridge.describe_image(img_b64)
-                    if "SKIP_PAGE" in text_desc or len(text_desc.strip()) < 30: continue
+                    text_desc = vision_bridge.describe_image(img_b64, page_num=i+1)
+                    if "SKIP_PAGE" in text_desc or len(text_desc.strip()) < 30: 
+                        logger.info(f"Skipping page {i+1} (Blank/Too short).")
+                        continue
                     
                     valid_texts.append(text_desc)
                     valid_ids.append(f"doc_{uploaded_file.name}_page_{i}")
@@ -146,6 +186,7 @@ with st.sidebar:
                 if valid_texts:
                     vectors = embedder.embed_batch(valid_texts, task="retrieval.passage")
                     collection.add(ids=valid_ids, embeddings=vectors, metadatas=valid_metas, documents=valid_texts)
+                    logger.info(f"Successfully added {len(valid_texts)} chunks to ChromaDB.")
                 
                 st.write(f"✅ Successfully analyzed and indexed {len(valid_texts)} pages.")
                 status.update(label="Analysis Complete", state="complete")
@@ -153,7 +194,9 @@ with st.sidebar:
                 st.session_state.messages = []
                 doc.close()
             except Exception as e:
-                st.error(f"Extraction Failed: {str(e)}")
+                error_trace = traceback.format_exc()
+                logger.error(f"Ingestion Failed:\n{error_trace}")
+                st.error(f"🚨 Extraction Failed: {str(e)}")
                 status.update(label="Failed", state="error")
 
     if st.button("🗑️ New Chat / Clear History"):
@@ -166,24 +209,18 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if not st.session_state.messages:
     st.markdown("""<div style="text-align: center; color: #808080; margin-top: 30px; margin-bottom: 30px;"><h3>👋 Welcome to DocuMind</h3><p>Upload a document on the left, then ask precise questions below.</p></div>""", unsafe_allow_html=True)
 
-# RENDER HISTORY (STRICTLY VALID EMOJIS)
 for message in st.session_state.messages:
     avatar = "👤" if message["role"] == "user" else "🧠"
     with st.chat_message(message["role"], avatar=avatar):
         st.markdown(message["content"])
 
-# CHAT INPUT
 if prompt := st.chat_input("Ask a precise question..."):
     if not st.session_state.active_doc:
         st.error("Please upload a document first!"); st.stop()
 
     st.session_state.messages.append({"role": "user", "content": prompt})
-    
-    # FIX 1: EXPLICIT EMOJI
-    with st.chat_message("user", avatar="👤"): 
-        st.markdown(prompt)
+    with st.chat_message("user", avatar="👤"): st.markdown(prompt)
 
-    # FIX 2: EXPLICIT EMOJI (NO MORE EMPTY STRINGS)
     with st.chat_message("assistant", avatar="🧠"):
         with st.spinner("Synthesizing precise answer..."):
             try:
@@ -191,8 +228,10 @@ if prompt := st.chat_input("Ask a precise question..."):
                 results = collection.query(query_embeddings=[query_vector], n_results=4)
                 
                 if not results['ids'][0]:
+                    logger.warning("No context retrieved from ChromaDB.")
                     answer = "No document context found. Please upload a PDF first."
                 else:
+                    logger.info(f"Retrieved {len(results['ids'][0])} chunks from DB.")
                     context_parts = []
                     for idx, doc_text in enumerate(results['documents'][0]):
                         metadata = results['metadatas'][0][idx]
@@ -203,4 +242,6 @@ if prompt := st.chat_input("Ask a precise question..."):
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except Exception as e:
-                st.error(f"Generation failed: {str(e)}")
+                error_trace = traceback.format_exc()
+                logger.error(f"Generation Failed:\n{error_trace}")
+                st.error(f"🚨 Generation Failed: {str(e)}")
