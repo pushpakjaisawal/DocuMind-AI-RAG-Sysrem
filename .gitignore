@@ -1,0 +1,11 @@
+.env
+.env.local
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+chroma_db_storage/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
