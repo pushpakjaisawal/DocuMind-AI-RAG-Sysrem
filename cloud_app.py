@@ -7,13 +7,15 @@ import streamlit as st
 import fitz # PyMuPDF
 from groq import Groq
 from dotenv import load_dotenv
-from PIL import Image
 
 # 1. LOAD CONFIGURATION
 load_dotenv()
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not NVIDIA_API_KEY:
+    st.error("CRITICAL: NVIDIA_API_KEY is missing from Streamlit Secrets!")
 
 JINA_MODEL = "jina-embeddings-v5-omni-small"
 NVIDIA_VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
@@ -46,6 +48,8 @@ class NvidiaVisionBridge:
             "temperature": 0.1, "max_tokens": 1500, "stream": False
         }
         response = requests.post(self.url, headers=self.headers, json=payload, timeout=60)
+        if response.status_code != 200:
+            raise Exception(f"NVIDIA API Error {response.status_code}: {response.text}")
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
@@ -121,19 +125,16 @@ with st.sidebar:
         with st.status(f"Analyzing {uploaded_file.name}...", expanded=True) as status:
             try:
                 file_bytes = uploaded_file.read()
-                
-                # PyMuPDF Rendering (No Poppler required!)
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 max_pages = min(len(doc), 20)
                 
                 valid_texts, valid_ids, valid_metas = [], [], []
                 for i in range(max_pages):
                     page = doc[i]
-                    # Render page to image at ~150 DPI (2x zoom)
                     mat = fitz.Matrix(2, 2) 
                     pix = page.get_pixmap(matrix=mat)
                     img_bytes = pix.tobytes("jpeg")
-                    img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+                    img_b64 = base64.b64encode(img_bytes).decode('utf-8').replace('\n', '')
                     
                     text_desc = vision_bridge.describe_image(img_b64)
                     if "SKIP_PAGE" in text_desc or len(text_desc.strip()) < 30: continue
@@ -152,10 +153,10 @@ with st.sidebar:
                 st.session_state.messages = []
                 doc.close()
             except Exception as e:
-                st.error(f"Error: {str(e)}")
+                st.error(f"Extraction Failed: {str(e)}")
                 status.update(label="Failed", state="error")
 
-    if st.button("️ New Chat / Clear History"):
+    if st.button("🗑️ New Chat / Clear History"):
         st.session_state.messages = []
         st.rerun()
 
@@ -165,19 +166,25 @@ if "messages" not in st.session_state: st.session_state.messages = []
 if not st.session_state.messages:
     st.markdown("""<div style="text-align: center; color: #808080; margin-top: 30px; margin-bottom: 30px;"><h3>👋 Welcome to DocuMind</h3><p>Upload a document on the left, then ask precise questions below.</p></div>""", unsafe_allow_html=True)
 
+# RENDER HISTORY (STRICTLY VALID EMOJIS)
 for message in st.session_state.messages:
     avatar = "👤" if message["role"] == "user" else "🧠"
     with st.chat_message(message["role"], avatar=avatar):
         st.markdown(message["content"])
 
+# CHAT INPUT
 if prompt := st.chat_input("Ask a precise question..."):
     if not st.session_state.active_doc:
         st.error("Please upload a document first!"); st.stop()
 
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar="👤"): st.markdown(prompt)
+    
+    # FIX 1: EXPLICIT EMOJI
+    with st.chat_message("user", avatar="👤"): 
+        st.markdown(prompt)
 
-    with st.chat_message("assistant", avatar=""):
+    # FIX 2: EXPLICIT EMOJI (NO MORE EMPTY STRINGS)
+    with st.chat_message("assistant", avatar="🧠"):
         with st.spinner("Synthesizing precise answer..."):
             try:
                 query_vector = embedder.embed_batch([prompt], task="retrieval.query")[0]
