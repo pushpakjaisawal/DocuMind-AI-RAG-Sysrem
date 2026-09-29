@@ -37,7 +37,7 @@ logger.info("✅ All API keys successfully loaded from environment.")
 JINA_MODEL = "jina-embeddings-v5-omni-small"
 NVIDIA_VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
 # FIX: Updated to a verified, active Groq model ID
-GROQ_MODEL = "llama-3.3-70b-versatile" 
+GROQ_MODEL = "llama-3.1-70b-versatile"
 
 # 3. PIPELINE CLASSES
 class JinaEmbedder:
